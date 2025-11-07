@@ -39,6 +39,45 @@
         }
       };
     </script>
+<script>
+  const GEOJSON_URL = './data/frames.geojson';
+
+  (async () => {
+    console.log('GeoJSON: loading', GEOJSON_URL);
+    const response = await fetch(GEOJSON_URL, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`GeoJSON fetch failed: ${response.status} ${response.statusText}`);
+    }
+
+    const fc = await response.json();
+    if (!fc || fc.type !== 'FeatureCollection') {
+      throw new Error('GeoJSON error: expected FeatureCollection');
+    }
+    if (!Array.isArray(fc.features)) {
+      throw new Error('GeoJSON error: features array missing');
+    }
+    if (fc.features.length === 0) {
+      throw new Error('GeoJSON error: features array is empty');
+    }
+
+    const firstFeature = fc.features[0];
+    const geometry = firstFeature && firstFeature.geometry;
+    if (!geometry || geometry.type !== 'Point') {
+      throw new Error('GeoJSON error: first feature must be Point');
+    }
+
+    const coords = geometry.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) {
+      throw new Error('GeoJSON error: invalid Point coordinates');
+    }
+
+    console.log(`GeoJSON loaded: ${fc.features.length} features`);
+    console.log('GeoJSON first coordinates:', coords.slice(0, 2));
+  })().catch((error) => {
+    console.error('GeoJSON load failed:', error);
+  });
+</script>
+
     <script
       src="https://api-maps.yandex.ru/2.1/?apikey=YOUR_YMAPS_API_KEY&lang=ru_RU"
       type="text/javascript"
