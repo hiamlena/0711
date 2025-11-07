@@ -15,6 +15,55 @@ const layers = {
   federal: null          // federal.geojson (федеральные трассы)
 };
 
+let yaErrorShown = false;
+
+function showYandexError(message, details) {
+  if (yaErrorShown) return;
+  yaErrorShown = true;
+  const text = message || 'Яндекс.Карты недоступны.';
+  toast(text);
+  if (details) {
+    // eslint-disable-next-line no-console
+    console.error('[TT] Yandex Maps error:', details);
+  }
+}
+
+function describeYandexError(err) {
+  const raw = typeof err === 'string' ? err : (err && (err.message || err.errorText)) || '';
+  if (/Failed to bundle/i.test(raw)) {
+    return 'Yandex Maps API не смог собрать пакет модулей ("Failed to bundle"). Проверьте параметр load=package.full или переключитесь на API v3.0.';
+  }
+  if (/Content Security Policy/i.test(raw) || /CSP/i.test(raw)) {
+    return 'CSP блокирует загрузку скрипта Яндекс.Карт. Добавьте https://api-maps.yandex.ru в директиву script-src/script-src-elem.';
+  }
+  if (raw) return raw;
+  return 'Не удалось загрузить Yandex Maps API.';
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('error', (event) => {
+    if (!event?.message) return;
+    if (/ymaps/i.test(event.message) || /api-maps\.yandex\.ru/.test(event.filename || '')) {
+      showYandexError(describeYandexError(event.message), event);
+    }
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event?.reason;
+    const raw = typeof reason === 'string' ? reason : reason?.message;
+    if (raw && /ymaps/i.test(raw)) {
+      showYandexError(describeYandexError(raw), reason);
+    }
+  });
+  document.addEventListener('securitypolicyviolation', (event) => {
+    if (!event?.blockedURI) return;
+    if (event.blockedURI.includes('yandex')) {
+      const directive = event.effectiveDirective || event.violatedDirective;
+      const msg = `CSP блокирует Яндекс.Карты (${directive}). Добавьте https://api-maps.yandex.ru в разрешённые источники.`;
+      showYandexError(msg, event);
+    }
+  });
+}
+
 /** Точка входа — загрузка SDK Яндекса и старт */
 export function init() {
   const cfg = (window.TRANSTIME_CONFIG && window.TRANSTIME_CONFIG.yandex) || null;
@@ -26,16 +75,53 @@ export function init() {
   window.__TT_YA_LOADING__ = true;
 
   const script = document.createElement('script');
-  script.src =
-    'https://api-maps.yandex.ru/2.1/?apikey=' + encodeURIComponent(cfg.apiKey) +
-    '&lang=' + encodeURIComponent(cfg.lang || 'ru_RU') +
-    '&load=package.standard,package.search,multiRouter.MultiRoute,package.geoObjects';
+  const loader = cfg.loader || {};
+  const params = new URLSearchParams({
+    apikey: cfg.apiKey,
+    lang: cfg.lang || 'ru_RU',
+    load: loader.load || 'package.full',
+    mode: loader.mode || 'release'
+  });
+  const apiBase = loader.baseUrl || 'https://api-maps.yandex.ru/2.1/';
+  script.src = `${apiBase}?${params.toString()}`;
+  if (cfg.nonce) script.nonce = cfg.nonce;
 
-  script.onload = () => (window.ymaps && typeof ymaps.ready === 'function')
-    ? ymaps.ready(setup)
-    : toast('Yandex API не инициализировался');
+  script.onload = () => {
+    if (!(window.ymaps && typeof ymaps.ready === 'function')) {
+      showYandexError('Yandex API не инициализировался');
+      return;
+    }
+    try {
+      const readyPromise = typeof ymaps.ready === 'function' ? ymaps.ready() : null;
+      if (readyPromise && typeof readyPromise.then === 'function') {
+        let settled = false;
+        const timeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          showYandexError('Yandex Maps API долго не отвечает. Возможна ошибка "Failed to bundle" или блокировка CSP.');
+        }, cfg.loader?.timeout || 12000);
+        readyPromise
+          .then(() => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeout);
+            setup();
+          })
+          .catch((err) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeout);
+            showYandexError(describeYandexError(err), err);
+          });
+      } else {
+        ymaps.ready(setup);
+      }
+    } catch (err) {
+      showYandexError(describeYandexError(err), err);
+    }
+  };
 
-  script.onerror = () => toast('Не удалось загрузить Yandex Maps');
+  script.onerror = () => showYandexError('Не удалось загрузить Yandex Maps', new Error('Script load error'));
   document.head.appendChild(script);
 }
 
