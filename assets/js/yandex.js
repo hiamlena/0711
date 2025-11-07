@@ -6,6 +6,7 @@ import { YandexRouter } from './router.js';
 
 const STORAGE_KEY = 'tt-yandex-saved-routes';
 let map, multiRoute, viaPoints = [];
+let multiRouteActiveRouteHandler = null;
 let viaMarkers = [];
 let lastPoints = null;
 let lastOptions = null;
@@ -29,6 +30,10 @@ const layers = {
   hgvConditional: null,  // hgv_conditional.geojson (условия для HGV)
   federal: null          // federal.geojson (федеральные трассы)
 };
+
+const FRAME_BUFFER_M = 100;
+let framesRawData = null;
+let framesLastRouteCoords = null;
 
 let yaErrorShown = false;
 
@@ -456,43 +461,111 @@ export function init() {
   document.head.appendChild(script);
 }
 
-/** Универсальный загрузчик GeoJSON в ObjectManager */
+/** Универсальный загрузчик GeoJSON в ObjectManager с диагностикой */
 async function loadGeoJsonLayer(url, options = {}) {
-  const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'v=' + Date.now());
+  const withBuster = url + (url.includes('?') ? '&' : '?') + 'v=' + Date.now();
+  const r = await fetch(withBuster, { cache: 'no-store' });
   if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
   const data = await r.json();
 
-  const om = new ymaps.ObjectManager({ clusterize: false });
-  if (options.preset) om.objects.options.set({ preset: options.preset });
-  if (options.zIndex) om.objects.options.set({ zIndex: options.zIndex });
-
-  // Нормализуем подсказки/баллоны, если есть properties
-  if (data && Array.isArray(data.features)) {
-    data.features.forEach(f => {
-      const p = f.properties || {};
-      f.properties = {
-        hintContent: p.name || p.title || 'Объект',
-        balloonContent:
-          `<b>${escapeHtml(p.name || p.title || 'Объект')}</b>` +
-          (p.comment ? `<div class="mt6">${escapeHtml(p.comment)}</div>` : '') +
-          (p.date ? `<div class="small mt6">Дата: ${escapeHtml(p.date)}</div>` : '')
-      };
-    });
+  if (!data || data.type !== 'FeatureCollection' || !Array.isArray(data.features)) {
+    throw new Error('Некорректный GeoJSON: ожидался FeatureCollection.features[] — ' + url);
   }
 
+  // Диагностика: пусто/типы геометрий
+  if (data.features.length === 0) {
+    toast('Слой пуст: ' + url.split('/').pop());
+  } else {
+    const types = new Map();
+    for (const f of data.features) {
+      const t = f?.geometry?.type || 'Unknown';
+      types.set(t, (types.get(t) || 0) + 1);
+    }
+    const summary = [...types.entries()].map(([t, c]) => `${t}:${c}`).join(', ');
+    toast(`Загружен ${url.split('/').pop()} — ${data.features.length} фич (${summary})`, 2200);
+  }
+
+  const om = new ymaps.ObjectManager({ clusterize: false });
+  if (options.preset) om.objects.options.set({ preset: options.preset });
+
+  // Общие стили (точки/линии/полигоны)
+  om.objects.options.set({
+    zIndex: options.zIndex || 200,
+    strokeColor: options.strokeColor || '#60a5fa',
+    strokeWidth: options.strokeWidth || 3,
+    strokeOpacity: options.strokeOpacity || 0.9,
+    fillColor: options.fillColor || 'rgba(96,165,250,.15)',
+    fillOpacity: options.fillOpacity || 0.3
+  });
+
+  // Нормализация тултипов
+  data.features.forEach(f => {
+    const p = f.properties || {};
+    f.properties = {
+      hintContent: p.name || p.title || 'Объект',
+      balloonContent:
+        `<b>${escapeHtml(p.name || p.title || 'Объект')}</b>` +
+        (p.comment ? `<div class="mt6">${escapeHtml(p.comment)}</div>` : '') +
+        (p.date ? `<div class="small mt6">Дата: ${escapeHtml(p.date)}</div>` : '')
+    };
+  });
+
   om.add(data);
+  try {
+    om.ttSourceData = JSON.parse(JSON.stringify(data));
+  } catch (err) {
+    om.ttSourceData = data;
+  }
   return om;
 }
 
 /** Конкретные загрузчики слоёв */
 async function loadFrames() {
-  if (layers.frames) return layers.frames;
-  layers.frames = await loadGeoJsonLayer('../data/frames_ready.geojson', {
-    preset: 'islands#blueCircleDotIcon',
-    zIndex: 220
-  });
-  map.geoObjects.add(layers.frames);
-  return layers.frames;
+  if (layers.frames) {
+    if (!framesRawData) {
+      const rawCached = layers.frames.ttSourceData
+        || (typeof layers.frames.objects?.getAll === 'function' ? layers.frames.objects.getAll() : null);
+      try {
+        framesRawData = rawCached ? JSON.parse(JSON.stringify(rawCached)) : { type: 'FeatureCollection', features: [] };
+      } catch (err) {
+        console.warn('[TT] frames raw clone failed', err); // eslint-disable-line no-console
+        framesRawData = rawCached || { type: 'FeatureCollection', features: [] };
+      }
+    }
+    return layers.frames;
+  }
+
+  // Пробуем набор типичных путей (зависит от того, где лежит страница: /, /map/, /pages/map/…)
+  const baseFromConfig = window.TRANSTIME_CONFIG?.layersBase || null;
+  const candidates = [];
+  if (baseFromConfig) candidates.push(baseFromConfig.replace(/\/$/, '') + '/frames_ready.geojson');
+  candidates.push('../data/frames_ready.geojson');
+  candidates.push('./data/frames_ready.geojson');
+  candidates.push('/data/frames_ready.geojson');
+
+  let lastErr = null;
+  for (const u of candidates) {
+    try {
+      const om = await loadGeoJsonLayer(u, {
+        preset: 'islands#blueCircleDotIcon',
+        zIndex: 220
+      });
+      const raw = om.ttSourceData || (typeof om.objects?.getAll === 'function' ? om.objects.getAll() : null);
+      try {
+        framesRawData = raw ? JSON.parse(JSON.stringify(raw)) : { type: 'FeatureCollection', features: [] };
+      } catch (err) {
+        console.warn('[TT] frames raw clone failed', err); // eslint-disable-line no-console
+        framesRawData = raw || { type: 'FeatureCollection', features: [] };
+      }
+      om.removeAll();
+      layers.frames = om;
+      return om;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  console.error('[TT] frames_ready load failed', lastErr);
+  toast('Не удалось загрузить frames_ready.geojson — проверь путь/валидность файла');
 }
 async function loadHgvAllowed() {
   if (layers.hgvAllowed) return layers.hgvAllowed;
@@ -522,6 +595,189 @@ async function loadFederal() {
   return layers.federal;
 }
 
+function toRadians(value) {
+  return (Number(value) * Math.PI) / 180;
+}
+
+function distanceMeters(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length < 2 || b.length < 2) return Infinity;
+  const lat1 = toRadians(a[0]);
+  const lat2 = toRadians(b[0]);
+  const dLat = toRadians(b[0] - a[0]);
+  const dLon = toRadians(b[1] - a[1]);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLon = Math.sin(dLon / 2);
+  const h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
+  return 2 * 6371000 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function pointToSegmentDistanceMeters(point, start, end) {
+  if (!Array.isArray(point) || !Array.isArray(start) || !Array.isArray(end)) return Infinity;
+  if (start.length < 2 || end.length < 2) return Infinity;
+  if (start[0] === end[0] && start[1] === end[1]) {
+    return distanceMeters(point, start);
+  }
+
+  const lat0 = toRadians((start[0] + end[0]) / 2);
+  const r = 6378137;
+  const toXY = (coords) => {
+    const lat = toRadians(coords[0]);
+    const lon = toRadians(coords[1]);
+    return {
+      x: r * lon * Math.cos(lat0),
+      y: r * lat
+    };
+  };
+
+  const p = toXY(point);
+  const a = toXY(start);
+  const b = toXY(end);
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const apx = p.x - a.x;
+  const apy = p.y - a.y;
+  const denom = abx * abx + aby * aby;
+  let t = 0;
+  if (denom > 0) {
+    t = (apx * abx + apy * aby) / denom;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+  }
+  const proj = {
+    x: a.x + abx * t,
+    y: a.y + aby * t
+  };
+  return Math.hypot(p.x - proj.x, p.y - proj.y);
+}
+
+function pointToPolylineMinDistanceMeters(point, polyline) {
+  if (!Array.isArray(polyline) || polyline.length < 2) return Infinity;
+  let min = Infinity;
+  for (let i = 1; i < polyline.length; i += 1) {
+    const dist = pointToSegmentDistanceMeters(point, polyline[i - 1], polyline[i]);
+    if (dist < min) {
+      min = dist;
+      if (min <= FRAME_BUFFER_M) return min;
+    }
+  }
+  return min;
+}
+
+function cloneFeature(feature) {
+  return JSON.parse(JSON.stringify(feature));
+}
+
+function filterFramesForRoute(routeCoords) {
+  const empty = { type: 'FeatureCollection', features: [] };
+  if (!framesRawData?.features?.length || !Array.isArray(routeCoords) || routeCoords.length < 2) {
+    return empty;
+  }
+
+  const filtered = [];
+  framesRawData.features.forEach((feature) => {
+    const geom = feature?.geometry;
+    if (!geom) return;
+    if (geom.type === 'Point') {
+      const coords = geom.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return;
+      const latLon = [Number(coords[1]), Number(coords[0])];
+      if (Number.isNaN(latLon[0]) || Number.isNaN(latLon[1])) return;
+      const dist = pointToPolylineMinDistanceMeters(latLon, routeCoords);
+      if (dist <= FRAME_BUFFER_M) {
+        filtered.push(cloneFeature(feature));
+      }
+    } else if (geom.type === 'LineString') {
+      const coords = Array.isArray(geom.coordinates) ? geom.coordinates : [];
+      if (!coords.length) return;
+      let min = Infinity;
+      coords.forEach((pair) => {
+        if (!Array.isArray(pair) || pair.length < 2) return;
+        const latLon = [Number(pair[1]), Number(pair[0])];
+        if (Number.isNaN(latLon[0]) || Number.isNaN(latLon[1])) return;
+        const dist = pointToPolylineMinDistanceMeters(latLon, routeCoords);
+        if (dist < min) min = dist;
+      });
+      if (min <= FRAME_BUFFER_M) {
+        filtered.push(cloneFeature(feature));
+      }
+    }
+  });
+
+  const result = { type: 'FeatureCollection', features: filtered };
+  if (framesRawData.properties) {
+    result.properties = { ...framesRawData.properties };
+  }
+  return result;
+}
+
+function extractRouteCoordinates(route) {
+  if (!route || typeof route.getPaths !== 'function') return null;
+  const coords = [];
+  route.getPaths().each((path) => {
+    path.getSegments().each((segment) => {
+      const segCoords = segment.getCoordinates();
+      if (Array.isArray(segCoords)) {
+        segCoords.forEach((pair) => {
+          if (Array.isArray(pair) && pair.length >= 2) {
+            coords.push([Number(pair[0]), Number(pair[1])]);
+          }
+        });
+      }
+    });
+  });
+  return coords.length ? coords : null;
+}
+
+function getActiveRouteCoordinates(mr) {
+  if (!mr) return null;
+  let active = null;
+  if (typeof mr.getActiveRoute === 'function') {
+    active = mr.getActiveRoute();
+  }
+  if (!active && typeof mr.getRoutes === 'function') {
+    const routes = mr.getRoutes();
+    if (routes) {
+      if (typeof routes.getLength === 'function' && routes.getLength() > 0) {
+        active = routes.get(0);
+      } else if (Array.isArray(routes) && routes.length > 0) {
+        active = routes[0];
+      }
+    }
+  }
+  if (!active) return null;
+  return extractRouteCoordinates(active);
+}
+
+async function updateFramesForRoute(routeCoords) {
+  framesLastRouteCoords = Array.isArray(routeCoords)
+    ? routeCoords.map(pt => (Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : pt)).filter(pt => Array.isArray(pt) && pt.length >= 2)
+    : null;
+
+  const toggle = document.getElementById('toggle-frames');
+  const isEnabled = !!toggle?.checked;
+  if (!isEnabled) return;
+
+  try {
+    const layer = await loadFrames();
+    if (!layer) return;
+    if (!map.geoObjects.contains(layer)) {
+      map.geoObjects.add(layer);
+    }
+
+    layer.removeAll();
+    if (!framesRawData?.features?.length || !framesLastRouteCoords || framesLastRouteCoords.length < 2) {
+      return;
+    }
+
+    const filtered = filterFramesForRoute(framesLastRouteCoords);
+    if (filtered.features.length) {
+      layer.add(filtered);
+    }
+  } catch (err) {
+    console.warn('[TT] updateFramesForRoute error', err); // eslint-disable-line no-console
+  }
+}
+
 /** Включение/выключение слоя по имени */
 async function toggleLayer(name, on) {
   if (!map) return;
@@ -536,10 +792,17 @@ async function toggleLayer(name, on) {
 
   if (on) {
     const layer = await loader();
+    if (!layer) return;
     if (!map.geoObjects.contains(layer)) map.geoObjects.add(layer);
+    if (name === 'frames') {
+      await updateFramesForRoute(framesLastRouteCoords);
+    }
   } else {
     const layer = layers[name];
     if (layer && map.geoObjects.contains(layer)) map.geoObjects.remove(layer);
+    if (name === 'frames' && layer?.removeAll) {
+      layer.removeAll();
+    }
   }
 }
 
@@ -702,9 +965,32 @@ async function onBuild() {
     const res = await YandexRouter.build(points, opts);
     const mr = res.multiRoute;
 
-    if (multiRoute) map.geoObjects.remove(multiRoute);
+    if (multiRoute) {
+      if (multiRouteActiveRouteHandler && multiRoute.events?.remove) {
+        try {
+          multiRoute.events.remove('activeroutechange', multiRouteActiveRouteHandler);
+        } catch (err) {
+          console.warn('[TT] remove activeroutechange handler failed', err); // eslint-disable-line no-console
+        }
+      }
+      map.geoObjects.remove(multiRoute);
+    }
     multiRoute = mr;
     map.geoObjects.add(multiRoute);
+
+    const handleActiveRouteChange = () => {
+      const coords = getActiveRouteCoordinates(multiRoute);
+      const maybePromise = updateFramesForRoute(coords);
+      if (maybePromise?.catch) {
+        maybePromise.catch((err) => console.warn('[TT] frames update failed', err)); // eslint-disable-line no-console
+      }
+    };
+    multiRouteActiveRouteHandler = handleActiveRouteChange;
+    if (multiRoute?.events?.add) {
+      multiRoute.events.add('activeroutechange', handleActiveRouteChange);
+    }
+
+    handleActiveRouteChange();
 
     const meta = {
       from: fromVal,
