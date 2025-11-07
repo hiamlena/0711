@@ -1,92 +1,169 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ru">
-<head>
-  <meta charset="utf-8" />
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1, maximum-scale=1"
-  />
-  <title>Trans-Time — Построение маршрута</title>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Яндекс.Карты — минимальный пример</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
 
-  <!-- Стили интерфейса -->
-  <link rel="stylesheet" href="./assets/css/style.css?v=2025-11-07" />
-</head>
-<body>
-  <header class="tt-header">
-    <h1>Trans-Time: Построение маршрута</h1>
-  </header>
+      #map {
+        width: 100%;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
 
-  <main class="tt-layout">
-    <!-- Панель управления -->
-    <section class="tt-panel">
-      <div class="tt-field-group">
-        <label class="tt-label">Тип транспорта</label>
-        <div class="tt-veh">
-          <label class="tt-chip">
-            <input type="radio" name="veh" value="car" /> Легковой
-          </label>
-          <label class="tt-chip">
-            <input type="radio" name="veh" value="truck40" checked /> Грузовой ≤ 40 т
-          </label>
-          <label class="tt-chip">
-            <input type="radio" name="veh" value="truckHeavy" /> Грузовой &gt; 40 т
-          </label>
-        </div>
-      </div>
+    <script>
+      console.log('Yandex Maps: init start');
 
-      <div class="tt-field">
-        <input id="from" class="tt-input" placeholder="A Откуда (поиск по адресу)" />
-      </div>
-      <div class="tt-field">
-        <input id="to" class="tt-input" placeholder="B Куда (поиск по адресу)" />
-      </div>
+      let geoJsonPromise = null;
+      let geoJsonData = null;
 
-      <div class="tt-actions">
-        <button id="buildBtn" class="tt-btn tt-btn-primary" disabled>
-          Построить маршрут
-        </button>
-        <button id="clearVia" class="tt-btn" disabled>
-          Сбросить via-точки
-        </button>
-      </div>
+      function normalizeGeoJson(fc) {
+        let autoId = 1;
+        const normalized = {
+          type: 'FeatureCollection',
+          features: [],
+        };
 
-      <details class="tt-details">
-        <summary>Слои</summary>
-        <div class="tt-layers">
-          <label class="tt-toggle">
-            <input type="checkbox" id="toggle-frames" />
-            <span>Весовые рамки</span>
-          </label>
-          <label class="tt-toggle">
-            <input type="checkbox" id="toggle-hgv-allowed" checked />
-            <span>Доступно HGV</span>
-          </label>
-          <label class="tt-toggle">
-            <input type="checkbox" id="toggle-hgv-conditional" />
-            <span>Условия HGV</span>
-          </label>
-          <label class="tt-toggle">
-            <input type="checkbox" id="toggle-federal" />
-            <span>Федеральные трассы</span>
-          </label>
-        </div>
-      </details>
+        for (const feature of fc.features) {
+          const geom = feature && feature.geometry;
+          if (!geom || geom.type !== 'Point') {
+            console.warn('GeoJSON: skipping non-Point feature', feature);
+            continue;
+          }
 
-      <p class="tt-note">
-        Нажми на карту, чтобы добавить via-точку. Подсказки появляются при наведении на неактивные кнопки.
-      </p>
-    </section>
+          const coords = geom.coordinates;
+          if (!Array.isArray(coords) || coords.length < 2) {
+            console.warn('GeoJSON: invalid Point coordinates, skipping', feature);
+            continue;
+          }
 
-    <!-- Карта -->
-    <section class="tt-map-wrap">
-      <div id="map" class="tt-map"></div>
-    </section>
-  </main>
+          const idSource = feature.properties && (feature.properties.id || feature.properties.objectId);
+          const featureId = idSource != null ? idSource : autoId++;
 
-  <!-- Конфиг с ключом: window.TRANSTIME_CONFIG = { yandex: { apiKey: '...', lang: 'ru_RU', ... } } -->
-  <script src="./config.js?v=2025-11-07"></script>
+          normalized.features.push({
+            type: 'Feature',
+            id: featureId,
+            geometry: {
+              type: 'Point',
+              coordinates: coords,
+            },
+            properties: feature.properties || {},
+            options: {
+              preset: 'islands#redCircleDotIcon',
+              zIndex: 650,
+            },
+          });
+        }
 
-  <!-- Логика карты (ES-модули) -->
-  <script type="module" src="./assets/js/yandex.js?v=2025-11-07"></script>
-</body>
+        return normalized;
+      }
+
+      async function loadGeoJson() {
+        const GEOJSON_URL = './data/frames.geojson';
+        console.log('GeoJSON: loading', GEOJSON_URL);
+
+        const response = await fetch(GEOJSON_URL, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`GeoJSON fetch failed: ${response.status} ${response.statusText}`);
+        }
+
+        const fc = await response.json();
+        if (!fc || fc.type !== 'FeatureCollection') {
+          throw new Error('GeoJSON error: expected FeatureCollection');
+        }
+
+        if (!Array.isArray(fc.features)) {
+          throw new Error('GeoJSON error: features array missing');
+        }
+
+        if (fc.features.length === 0) {
+          throw new Error('GeoJSON error: features array is empty');
+        }
+
+        const firstFeature = fc.features[0];
+        const geometry = firstFeature && firstFeature.geometry;
+        if (!geometry || geometry.type !== 'Point') {
+          throw new Error('GeoJSON error: first feature must be Point');
+        }
+
+        const coords = geometry.coordinates;
+        if (!Array.isArray(coords) || coords.length < 2) {
+          throw new Error('GeoJSON error: invalid Point coordinates');
+        }
+
+        console.log(`GeoJSON loaded: ${fc.features.length} features`);
+        console.log('GeoJSON first coordinates:', coords.slice(0, 2));
+
+        return normalizeGeoJson(fc);
+      }
+
+      function attachObjectManager(map, data) {
+        try {
+          console.log('ObjectManager: creating instance');
+          const om = new ymaps.ObjectManager({
+            clusterize: true,
+            gridSize: 64,
+            clusterDisableClickZoom: false,
+          });
+
+          om.add(data);
+          map.geoObjects.add(om);
+          console.log(`ObjectManager: added ${data.features.length} features`);
+
+          const bounds = om.getBounds();
+          if (bounds) {
+            map.setBounds(bounds, { checkZoomRange: true, zoomMargin: 40 });
+            console.log('ObjectManager: map bounds updated');
+          }
+        } catch (error) {
+          console.error('ObjectManager: failed to attach data', error);
+        }
+      }
+
+      function init() {
+        console.log('Yandex Maps: init success');
+        const map = new ymaps.Map('map', {
+          center: [55.751244, 37.618423],
+          zoom: 5,
+        });
+
+        geoJsonPromise
+          .then((data) => {
+            geoJsonData = data;
+            attachObjectManager(map, data);
+          })
+          .catch((error) => {
+            console.error('GeoJSON: failed to add to map', error);
+          });
+      }
+
+      geoJsonPromise = loadGeoJson().catch((error) => {
+        console.error('GeoJSON load failed:', error);
+        throw error;
+      });
+
+      window.ymapsReadyHandler = function () {
+        if (window.ymaps) {
+          ymaps.ready(init);
+        } else {
+          console.error('Yandex Maps: ymaps object is not available');
+        }
+      };
+    </script>
+    <script
+      src="https://api-maps.yandex.ru/2.1/?apikey=YOUR_YMAPS_API_KEY&lang=ru_RU"
+      type="text/javascript"
+      onload="window.ymapsReadyHandler()"
+      onerror="console.error('Yandex Maps: failed to load API script')"
+    ></script>
+  </body>
 </html>
