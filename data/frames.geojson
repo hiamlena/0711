@@ -1,0 +1,47 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "moscow-frame",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [37.617635, 55.755814]
+      },
+      "properties": {
+        "id": "moscow-frame",
+        "name": "Москва",
+        "status": "Готово",
+        "url": "https://example.com/moscow"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "spb-frame",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [30.315868, 59.939095]
+      },
+      "properties": {
+        "id": "spb-frame",
+        "name": "Санкт-Петербург",
+        "status": "В процессе",
+        "url": "https://example.com/spb"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "novosibirsk-frame",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [82.9346, 55.0415]
+      },
+      "properties": {
+        "id": "novosibirsk-frame",
+        "name": "Новосибирск",
+        "status": "Запланировано",
+        "url": "https://example.com/novosibirsk"
+      }
+    }
+  ]
+}
