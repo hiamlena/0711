@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Яндекс.Карты — минимальный пример</title>
+    <title>Яндекс.Карты — ObjectManager пример</title>
     <style>
       html,
       body {
@@ -14,75 +14,300 @@
       #map {
         width: 100%;
         height: 100vh;
+        position: relative;
+        z-index: 1;
       }
     </style>
+    <!--
+      Пример структуры файла data/frames.geojson:
+      {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "id": "moscow-frame",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [37.617635, 55.755814]
+            },
+            "properties": {
+              "id": "moscow-frame",
+              "name": "Москва",
+              "status": "Готово",
+              "url": "https://example.com/moscow"
+            }
+          },
+          {
+            "type": "Feature",
+            "id": "spb-frame",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [30.315868, 59.939095]
+            },
+            "properties": {
+              "id": "spb-frame",
+              "name": "Санкт-Петербург",
+              "status": "В процессе",
+              "url": "https://example.com/spb"
+            }
+          },
+          {
+            "type": "Feature",
+            "id": "novosibirsk-frame",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [82.9346, 55.0415]
+            },
+            "properties": {
+              "id": "novosibirsk-frame",
+              "name": "Новосибирск",
+              "status": "Запланировано",
+              "url": "https://example.com/novosibirsk"
+            }
+          }
+        ]
+      }
+    -->
   </head>
   <body>
     <div id="map"></div>
 
     <script>
+      const GEOJSON_URL = './data/frames.geojson';
+      let mapInstance = null;
+      let objectManager = null;
+      let featureIdCounter = 1;
+
       console.log('Yandex Maps: init start');
 
-      function init() {
-        console.log('Yandex Maps: init success');
-        new ymaps.Map('map', {
-          center: [55.751244, 37.618423],
-          zoom: 5,
-        });
+      function createBalloonContent(properties = {}) {
+        const status = typeof properties.status === 'string' && properties.status.trim() !== ''
+          ? properties.status
+          : 'Статус не указан';
+        const url = typeof properties.url === 'string' && properties.url.trim() !== ''
+          ? `<a href="${properties.url}" target="_blank" rel="noopener noreferrer">Открыть</a>`
+          : 'Ссылка отсутствует';
+        const title = typeof properties.name === 'string' && properties.name.trim() !== ''
+          ? `<strong>${properties.name}</strong>`
+          : '';
+        return `
+          <div class="balloon">
+            ${title}
+            <div>Статус: ${status}</div>
+            <div>${url}</div>
+          </div>
+        `;
       }
 
-      window.ymapsReadyHandler = function () {
-        if (window.ymaps) {
-          ymaps.ready(init);
+      async function loadGeoJsonCollection() {
+        console.log('GeoJSON: старт загрузки', GEOJSON_URL);
+        const response = await fetch(GEOJSON_URL, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`GeoJSON: ошибка загрузки ${response.status} ${response.statusText}`);
+        }
+
+        const fc = await response.json();
+        if (!fc || fc.type !== 'FeatureCollection') {
+          throw new Error('GeoJSON: ожидался FeatureCollection');
+        }
+        if (!Array.isArray(fc.features)) {
+          throw new Error('GeoJSON: отсутствует массив features');
+        }
+        if (fc.features.length === 0) {
+          throw new Error('GeoJSON: массив features пуст');
+        }
+
+        const firstFeature = fc.features[0];
+        if (!firstFeature || !firstFeature.geometry || firstFeature.geometry.type !== 'Point') {
+          throw new Error('GeoJSON: первая фича должна быть Point');
+        }
+        const firstCoords = firstFeature.geometry.coordinates;
+        if (!Array.isArray(firstCoords) || firstCoords.length < 2) {
+          throw new Error('GeoJSON: первые координаты заданы неверно');
+        }
+
+        console.log(`GeoJSON: загружено ${fc.features.length} фич (включая потенциально невалидные)`);
+        console.log('GeoJSON: первые координаты', firstCoords[0], firstCoords[1]);
+
+        return fc;
+      }
+
+      function prepareFeatureCollection(rawCollection) {
+        const validFeatures = [];
+        const invalidSamples = [];
+        let validCount = 0;
+        let invalidCount = 0;
+
+        for (let index = 0; index < rawCollection.features.length; index += 1) {
+          const feature = rawCollection.features[index];
+          const geometry = feature && feature.geometry;
+          const coords = geometry && geometry.coordinates;
+
+          if (!feature || geometry?.type !== 'Point') {
+            invalidCount += 1;
+            if (invalidSamples.length < 3) {
+              invalidSamples.push({ index, reason: 'Geometry is not Point', geometry });
+            }
+            continue;
+          }
+
+          if (!Array.isArray(coords) || coords.length < 2) {
+            invalidCount += 1;
+            if (invalidSamples.length < 3) {
+              invalidSamples.push({ index, reason: 'Coordinates are not an array[lon, lat]', coordinates: coords });
+            }
+            continue;
+          }
+
+          const lon = Number(coords[0]);
+          const lat = Number(coords[1]);
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+            invalidCount += 1;
+            if (invalidSamples.length < 3) {
+              invalidSamples.push({ index, reason: 'Coordinates are not finite numbers', coordinates: coords });
+            }
+            continue;
+          }
+
+          const properties = Object.assign({}, feature.properties || {});
+          const featureId = feature.id || properties.id || `feature-${featureIdCounter++}`;
+          const preparedFeature = {
+            type: 'Feature',
+            id: featureId,
+            geometry: {
+              type: 'Point',
+              coordinates: [lon, lat],
+            },
+            properties: Object.assign(properties, {
+              balloonContent: createBalloonContent(properties),
+              hintContent:
+                properties.hint ||
+                properties.name ||
+                properties.status ||
+                String(featureId),
+            }),
+            options: {
+              preset: 'islands#redCircleDotIcon',
+              zIndex: 650,
+              zIndexActive: 700,
+            },
+          };
+
+          validFeatures.push(preparedFeature);
+          validCount += 1;
+        }
+
+        console.log(`GeoJSON: всего ${rawCollection.features.length}, валидных ${validCount}, невалидных ${invalidCount}`);
+        if (invalidSamples.length > 0) {
+          console.warn('GeoJSON: примеры невалидных фич', invalidSamples);
+        }
+
+        if (validCount === 0) {
+          console.warn('GeoJSON: валидных точек не найдено, ObjectManager обновляться не будет');
+          return null;
+        }
+
+        return {
+          type: 'FeatureCollection',
+          features: validFeatures,
+        };
+      }
+
+      async function loadAndRenderData() {
+        try {
+          const rawCollection = await loadGeoJsonCollection();
+          const preparedCollection = prepareFeatureCollection(rawCollection);
+          if (!preparedCollection) {
+            return;
+          }
+
+          objectManager.removeAll();
+          objectManager.add(preparedCollection);
+          console.log(`ObjectManager: добавлено ${preparedCollection.features.length} точек`);
+
+          const bounds = objectManager.getBounds();
+          if (bounds) {
+            console.log('Yandex Maps: применяем границы по данным');
+            mapInstance.setBounds(bounds, { checkZoomRange: true, zoomMargin: 40 });
+          } else {
+            console.warn('ObjectManager: getBounds() вернул пустое значение');
+          }
+        } catch (error) {
+          console.error('GeoJSON: ошибка отображения данных', error);
+        }
+      }
+
+      async function initMap() {
+        try {
+          console.log('Yandex Maps: создание экземпляра карты');
+          mapInstance = new ymaps.Map(
+            'map',
+            {
+              center: [55.751244, 37.618423],
+              zoom: 5,
+              controls: ['zoomControl', 'typeSelector', 'geolocationControl'],
+            },
+            {
+              suppressMapOpenBlock: true,
+            },
+          );
+          console.log('Yandex Maps: карта инициализирована успешно');
+
+          objectManager = new ymaps.ObjectManager({
+            clusterize: true,
+            gridSize: 64,
+            clusterDisableClickZoom: false,
+            geoObjectHideIconOnBalloonOpen: false,
+          });
+
+          objectManager.objects.options.set('preset', 'islands#redCircleDotIcon');
+          objectManager.objects.options.set('zIndex', 650);
+          objectManager.objects.options.set('zIndexActive', 700);
+          objectManager.objects.options.set('openBalloonOnClick', true);
+
+          objectManager.clusters.options.set('zIndex', 650);
+          objectManager.clusters.options.set('zIndexActive', 700);
+          objectManager.clusters.events.add('click', (event) => {
+            const target = event.get('target');
+            if (target && typeof target.getBounds === 'function') {
+              const clusterBounds = target.getBounds();
+              if (clusterBounds) {
+                console.log('ObjectManager: зум по кластеру');
+                mapInstance.setBounds(clusterBounds, { checkZoomRange: true, zoomMargin: 40 });
+              }
+            }
+          });
+
+          mapInstance.geoObjects.add(objectManager);
+          console.log('ObjectManager: добавлен на карту, начинаем загрузку данных');
+          await loadAndRenderData();
+        } catch (error) {
+          console.error('Yandex Maps: ошибка инициализации карты', error);
+        }
+      }
+
+      window.handleYmapsLoaded = function handleYmapsLoaded() {
+        console.log('Yandex Maps: API script loaded');
+        if (window.ymaps && typeof ymaps.ready === 'function') {
+          try {
+            ymaps.ready(() => {
+              console.log('Yandex Maps: ymaps.ready resolved');
+              initMap();
+            });
+          } catch (error) {
+            console.error('Yandex Maps: ymaps.ready вызвал ошибку', error);
+          }
         } else {
-          console.error('Yandex Maps: ymaps object is not available');
+          console.error('Yandex Maps: объект ymaps недоступен после загрузки скрипта');
         }
       };
     </script>
-<script>
-  const GEOJSON_URL = './data/frames.geojson';
-
-  (async () => {
-    console.log('GeoJSON: loading', GEOJSON_URL);
-    const response = await fetch(GEOJSON_URL, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`GeoJSON fetch failed: ${response.status} ${response.statusText}`);
-    }
-
-    const fc = await response.json();
-    if (!fc || fc.type !== 'FeatureCollection') {
-      throw new Error('GeoJSON error: expected FeatureCollection');
-    }
-    if (!Array.isArray(fc.features)) {
-      throw new Error('GeoJSON error: features array missing');
-    }
-    if (fc.features.length === 0) {
-      throw new Error('GeoJSON error: features array is empty');
-    }
-
-    const firstFeature = fc.features[0];
-    const geometry = firstFeature && firstFeature.geometry;
-    if (!geometry || geometry.type !== 'Point') {
-      throw new Error('GeoJSON error: first feature must be Point');
-    }
-
-    const coords = geometry.coordinates;
-    if (!Array.isArray(coords) || coords.length < 2) {
-      throw new Error('GeoJSON error: invalid Point coordinates');
-    }
-
-    console.log(`GeoJSON loaded: ${fc.features.length} features`);
-    console.log('GeoJSON first coordinates:', coords.slice(0, 2));
-  })().catch((error) => {
-    console.error('GeoJSON load failed:', error);
-  });
-</script>
 
     <script
       src="https://api-maps.yandex.ru/2.1/?apikey=YOUR_YMAPS_API_KEY&lang=ru_RU"
       type="text/javascript"
-      onload="window.ymapsReadyHandler()"
-      onerror="console.error('Yandex Maps: failed to load API script')"
+      onload="window.handleYmapsLoaded()"
+      onerror="console.error('Yandex Maps: не удалось загрузить API скрипт')"
     ></script>
   </body>
 </html>
