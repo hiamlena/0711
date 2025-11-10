@@ -50,6 +50,19 @@ function showYandexError(message, details) {
   }
 }
 
+function getFeatureKey(feature) {
+  if (!feature) return null;
+  const rawId = typeof feature.id !== 'undefined' ? feature.id : feature.properties?.id;
+  if (rawId === null || typeof rawId === 'undefined') return null;
+  if (typeof rawId === 'number') return String(rawId);
+  if (typeof rawId === 'string') return rawId;
+  try {
+    return JSON.stringify(rawId);
+  } catch (err) {
+    return null;
+  }
+}
+
 function describeYandexError(err) {
   const raw = typeof err === 'string' ? err : (err && (err.message || err.errorText)) || '';
   if (/Failed to bundle/i.test(raw)) {
@@ -573,6 +586,7 @@ export function init() {
 
 /** Универсальный загрузчик GeoJSON в ObjectManager с диагностикой */
 async function loadGeoJsonLayer(url, options = {}) {
+  const { idPrefix = 'obj', ...layerOptions } = options;
   const withBuster = url + (url.includes('?') ? '&' : '?') + 'v=' + Date.now();
   const r = await fetch(withBuster, { cache: 'no-store' });
   if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
@@ -596,20 +610,20 @@ async function loadGeoJsonLayer(url, options = {}) {
   }
 
   const om = new ymaps.ObjectManager({ clusterize: false });
-  if (options.preset) om.objects.options.set({ preset: options.preset });
+  if (layerOptions.preset) om.objects.options.set({ preset: layerOptions.preset });
 
   // Общие стили (точки/линии/полигоны)
   om.objects.options.set({
-    zIndex: options.zIndex || 200,
-    strokeColor: options.strokeColor || '#60a5fa',
-    strokeWidth: options.strokeWidth || 3,
-    strokeOpacity: options.strokeOpacity || 0.9,
-    fillColor: options.fillColor || 'rgba(96,165,250,.15)',
-    fillOpacity: options.fillOpacity || 0.3
+    zIndex: layerOptions.zIndex || 200,
+    strokeColor: layerOptions.strokeColor || '#60a5fa',
+    strokeWidth: layerOptions.strokeWidth || 3,
+    strokeOpacity: layerOptions.strokeOpacity || 0.9,
+    fillColor: layerOptions.fillColor || 'rgba(96,165,250,.15)',
+    fillOpacity: layerOptions.fillOpacity || 0.3
   });
 
   // Нормализация тултипов
-  data.features.forEach(f => {
+  data.features.forEach((f, idx) => {
     const p = f.properties || {};
     f.properties = {
       hintContent: p.name || p.title || 'Объект',
@@ -618,6 +632,25 @@ async function loadGeoJsonLayer(url, options = {}) {
         (p.comment ? `<div class="mt6">${escapeHtml(p.comment)}</div>` : '') +
         (p.date ? `<div class="small mt6">Дата: ${escapeHtml(p.date)}</div>` : '')
     };
+
+    if (typeof f.id === 'undefined' || f.id === null || f.id === '') {
+      const rawId = p.id;
+      if (typeof rawId === 'string' && rawId.trim()) {
+        f.id = rawId.trim();
+      } else if (typeof rawId === 'number' && Number.isFinite(rawId)) {
+        f.id = `${idPrefix}-${rawId}`;
+      } else {
+        f.id = `${idPrefix}-${idx}`;
+      }
+    } else if (typeof f.id === 'number') {
+      f.id = `${idPrefix}-${f.id}`;
+    } else {
+      f.id = String(f.id);
+    }
+
+    if (!f.properties.id) {
+      f.properties.id = f.id;
+    }
   });
 
   om.add(data);
@@ -658,7 +691,8 @@ async function loadFrames() {
     try {
       const om = await loadGeoJsonLayer(u, {
         preset: 'islands#blueCircleDotIcon',
-        zIndex: 220
+        zIndex: 220,
+        idPrefix: 'frame'
       });
       const raw = om.ttSourceData || (typeof om.objects?.getAll === 'function' ? om.objects.getAll() : null);
       try {
@@ -667,7 +701,6 @@ async function loadFrames() {
         console.warn('[TT] frames raw clone failed', err); // eslint-disable-line no-console
         framesRawData = raw || { type: 'FeatureCollection', features: [] };
       }
-      om.removeAll();
       layers.frames = om;
       return om;
     } catch (e) {
@@ -880,21 +913,27 @@ function getActiveRouteIndex(mr) {
   return -1;
 }
 
+function isFramesLayerEnabled() {
+  const toggle = document.getElementById('toggle-frames');
+  if (toggle) return !!toggle.checked;
+  const layer = layers.frames;
+  if (!layer || !map?.geoObjects?.contains) return false;
+  try {
+    return map.geoObjects.contains(layer);
+  } catch (err) {
+    return false;
+  }
+}
+
 async function updateFramesForRoute(routeCoords) {
   framesLastRouteCoords = Array.isArray(routeCoords)
     ? routeCoords.map(pt => (Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : pt)).filter(pt => Array.isArray(pt) && pt.length >= 2)
     : null;
 
-  const toggle = document.getElementById('toggle-frames');
-  const isEnabled = !!toggle?.checked;
-  if (!isEnabled) return;
+  if (!isFramesLayerEnabled()) return;
 
-  const vehicleType = lastMeta?.vehicle || lastOptions?.vehicle || lastOptions?.mode;
-  if (vehicleType === 'car' || vehicleType === 'auto') {
-    const layer = layers.frames;
-    if (layer?.removeAll) layer.removeAll();
-    return;
-  }
+  const vehicleTypeRaw = lastMeta?.vehicle || lastOptions?.vehicle || lastOptions?.mode;
+  const vehicleType = typeof vehicleTypeRaw === 'string' ? vehicleTypeRaw.toLowerCase() : vehicleTypeRaw;
 
   try {
     const layer = await loadFrames();
@@ -903,17 +942,65 @@ async function updateFramesForRoute(routeCoords) {
       map.geoObjects.add(layer);
     }
 
-    layer.removeAll();
-    if (!framesRawData?.features?.length || !framesLastRouteCoords || framesLastRouteCoords.length < 2) {
+    const objects = layer.objects;
+    const hasFilter = typeof objects?.setFilter === 'function';
+    const resetAll = () => {
+      if (hasFilter) {
+        objects.setFilter(null);
+      } else if (layer.removeAll && framesRawData) {
+        layer.removeAll();
+        layer.add(framesRawData);
+      }
+    };
+    const hideAll = () => {
+      if (hasFilter) {
+        objects.setFilter(() => false);
+      } else if (layer.removeAll) {
+        layer.removeAll();
+      }
+    };
+
+    if (!framesRawData?.features?.length) {
+      hideAll();
+      return;
+    }
+
+    if (vehicleType === 'car' || vehicleType === 'auto') {
+      hideAll();
+      return;
+    }
+
+    if (!framesLastRouteCoords || framesLastRouteCoords.length < 2) {
+      resetAll();
       return;
     }
 
     const filtered = filterFramesForRoute(framesLastRouteCoords);
-    if (filtered.features.length) {
-      layer.add(filtered);
+    if (!filtered.features.length) {
+      hideAll();
+      return;
+    }
+
+    const allowedIds = new Set();
+    filtered.features.forEach((feature) => {
+      const key = getFeatureKey(feature);
+      if (key) allowedIds.add(key);
+    });
+
+    if (!allowedIds.size) {
+      hideAll();
+      return;
+    }
+
+    if (hasFilter) {
+      objects.setFilter(obj => allowedIds.has(getFeatureKey(obj)));
+    } else {
+      layer.removeAll?.();
+      layer.add?.(filtered);
     }
   } catch (err) {
     console.warn('[TT] updateFramesForRoute error', err); // eslint-disable-line no-console
+    toast('Ошибка обновления весовых рамок: ' + (err?.message || err));
   }
 }
 
@@ -939,8 +1026,8 @@ async function toggleLayer(name, on) {
   } else {
     const layer = layers[name];
     if (layer && map.geoObjects.contains(layer)) map.geoObjects.remove(layer);
-    if (name === 'frames' && layer?.removeAll) {
-      layer.removeAll();
+    if (name === 'frames' && layer?.objects?.setFilter) {
+      layer.objects.setFilter(null);
     }
   }
 }
