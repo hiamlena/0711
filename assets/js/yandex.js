@@ -524,6 +524,10 @@ export function init() {
     load: loader.load || 'package.full',
     mode: loader.mode || 'release'
   });
+  const suggestKey = cfg.suggestApiKey || cfg.suggestKey || null;
+  if (suggestKey) {
+    params.set('suggest_apikey', suggestKey);
+  }
   const apiBase = loader.baseUrl || 'https://api-maps.yandex.ru/2.1/';
   script.src = `${apiBase}?${params.toString()}`;
   if (cfg.nonce) script.nonce = cfg.nonce;
