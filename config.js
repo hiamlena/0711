@@ -4,8 +4,8 @@ window.TRANSTIME_CONFIG = {
     lang: 'ru_RU'
   },
   map: {
-    center: [55.751244, 37.618423],
-    zoom: 8
+    center: [55.028, 82.921], // Новосибирск по умолчанию
+    zoom: 9
   },
   debug: true
 };

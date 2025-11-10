@@ -1069,12 +1069,29 @@
         setPanelOpen(window.innerWidth > 1024);
       }
 
+    </script>
+    <script src="./config.js?v=2025-11-07"></script>
+    <script>
+      const mapConfig = (window.TRANSTIME_CONFIG && window.TRANSTIME_CONFIG.map) || {};
+
+      function getMapCenter() {
+        if (Array.isArray(mapConfig.center) && mapConfig.center.length === 2) {
+          return mapConfig.center;
+        }
+        return [55.751244, 37.618423];
+      }
+
+      function getMapZoom() {
+        const zoom = Number(mapConfig.zoom);
+        return Number.isFinite(zoom) ? zoom : 5;
+      }
+
       function init() {
         safeLog('Yandex Maps: init');
         try {
           map = new ymaps.Map('map', {
-            center: [55.751244, 37.618423],
-            zoom: 5,
+            center: getMapCenter(),
+            zoom: getMapZoom(),
             controls: ['zoomControl', 'typeSelector', 'geolocationControl', 'trafficControl'],
           });
         } catch (error) {
@@ -1106,12 +1123,37 @@
           console.error('Yandex Maps: объект ymaps недоступен');
         }
       };
+
+      (function loadYandexSdk() {
+        const yaConfig = (window.TRANSTIME_CONFIG && window.TRANSTIME_CONFIG.yandex) || null;
+        if (!yaConfig || !yaConfig.apiKey) {
+          console.error('Yandex Maps: не задан API-ключ в config.js');
+          return;
+        }
+
+        const params = new URLSearchParams({
+          apikey: yaConfig.apiKey,
+          lang: yaConfig.lang || 'ru_RU',
+        });
+
+        if (yaConfig.loader?.load) params.set('load', yaConfig.loader.load);
+        if (yaConfig.loader?.mode) params.set('mode', yaConfig.loader.mode);
+        if (yaConfig.loader?.ns) params.set('ns', yaConfig.loader.ns);
+
+        const apiBase = yaConfig.loader?.baseUrl || 'https://api-maps.yandex.ru/2.1/';
+        const script = document.createElement('script');
+        script.src = `${apiBase}?${params.toString()}`;
+        script.async = true;
+        script.onload = () => window.ymapsReadyHandler();
+        script.onerror = (event) => {
+          console.error('Yandex Maps: не удалось загрузить API скрипт', event);
+        };
+        if (yaConfig.nonce) {
+          script.nonce = yaConfig.nonce;
+        }
+
+        document.head.appendChild(script);
+      })();
     </script>
-    <script
-      src="https://api-maps.yandex.ru/2.1/?apikey=YOUR_YMAPS_API_KEY&lang=ru_RU"
-      type="text/javascript"
-      onload="window.ymapsReadyHandler()"
-      onerror="console.error('Yandex Maps: не удалось загрузить API скрипт')"
-    ></script>
   </body>
 </html>
