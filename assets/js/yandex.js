@@ -7,6 +7,7 @@ import { YandexRouter } from './router.js';
 const STORAGE_KEY = 'tt-yandex-saved-routes';
 let map, multiRoute, viaPoints = [];
 let multiRouteActiveRouteHandler = null;
+let multiRouteRequestSuccessHandler = null;
 let viaMarkers = [];
 let lastPoints = null;
 let lastOptions = null;
@@ -19,7 +20,8 @@ const dom = {
   saveBtn: null,
   shareBtn: null,
   openNavBtn: null,
-  savedList: null
+  savedList: null,
+  routeList: null
 };
 let updateUI = () => {};
 
@@ -106,6 +108,11 @@ function setLastRoute(points, options = {}, meta = {}) {
   refreshActionButtons();
 }
 
+function patchLastMeta(data = {}) {
+  if (!data || typeof data !== 'object') return;
+  lastMeta = { ...(lastMeta || {}), ...data };
+}
+
 function setViaPoints(points = []) {
   viaPoints = Array.isArray(points) ? points.map(pt => (Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : pt)) : [];
   if (map) {
@@ -167,23 +174,22 @@ function renderSavedRoutes() {
   const frag = document.createDocumentFragment();
   saved.forEach(route => {
     const wrap = document.createElement('div');
-    wrap.style.display = 'flex';
-    wrap.style.gap = '6px';
-    wrap.style.marginBottom = '6px';
+    wrap.className = 'tt-saved-route';
 
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'tt-btn';
+    btn.className = 'tt-btn tt-btn-ghost tt-saved-route__load';
     btn.dataset.action = 'load';
     btn.dataset.routeId = route.id;
     btn.textContent = route.name || `${route.from || 'A'} → ${route.to || 'B'}`;
 
     const del = document.createElement('button');
     del.type = 'button';
-    del.className = 'tt-btn';
+    del.className = 'tt-btn tt-btn-icon';
     del.dataset.action = 'delete';
     del.dataset.routeId = route.id;
     del.title = 'Удалить маршрут';
+    del.setAttribute('aria-label', 'Удалить маршрут');
     del.textContent = '×';
 
     wrap.appendChild(btn);
@@ -201,6 +207,106 @@ function deleteSavedRoute(id) {
   writeSavedRoutes(next);
   renderSavedRoutes();
   toast('Маршрут удалён', 1600);
+}
+
+function setRouteListEmpty(message = 'Постройте маршрут, чтобы увидеть альтернативы.') {
+  if (!dom.routeList) return;
+  dom.routeList.classList.add('is-empty');
+  dom.routeList.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.className = 'tt-route-empty';
+  empty.textContent = message;
+  dom.routeList.appendChild(empty);
+}
+
+function highlightActiveRoute(activeIndex) {
+  if (!dom.routeList) return;
+  const items = dom.routeList.querySelectorAll('.tt-route-item');
+  items.forEach((btn) => {
+    const idx = Number(btn.dataset.index);
+    const isActive = Number.isInteger(activeIndex) && idx === activeIndex;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  });
+}
+
+function updateRouteList(routesCollection) {
+  if (!dom.routeList) return;
+  if (!routesCollection) {
+    setRouteListEmpty();
+    return;
+  }
+
+  let length = 0;
+  if (typeof routesCollection.getLength === 'function') {
+    length = routesCollection.getLength();
+  } else if (Array.isArray(routesCollection)) {
+    length = routesCollection.length;
+  }
+
+  if (!length) {
+    setRouteListEmpty('Маршрут не найден.');
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+
+  for (let i = 0; i < length; i += 1) {
+    const route = typeof routesCollection.get === 'function'
+      ? routesCollection.get(i)
+      : routesCollection[i];
+    if (!route) continue;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tt-route-item';
+    btn.dataset.index = String(i);
+    btn.setAttribute('aria-pressed', 'false');
+
+    const title = document.createElement('strong');
+    title.textContent = i === 0 ? 'Основной маршрут' : `Альтернатива ${i}`;
+    btn.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'tt-route-meta';
+
+    try {
+      const distance = route.properties?.get('distance');
+      if (distance?.value) {
+        const span = document.createElement('span');
+        span.textContent = fmtDist(distance.value);
+        meta.appendChild(span);
+      }
+      const duration = route.properties?.get('duration');
+      if (duration?.value) {
+        const span = document.createElement('span');
+        span.textContent = fmtTime(duration.value);
+        meta.appendChild(span);
+      }
+    } catch (err) {
+      console.warn('[TT] route meta error', err); // eslint-disable-line no-console
+    }
+
+    if (viaPoints.length) {
+      const span = document.createElement('span');
+      span.textContent = `via: ${viaPoints.length}`;
+      meta.appendChild(span);
+    }
+
+    if (!meta.children.length) {
+      const span = document.createElement('span');
+      span.textContent = 'Данные маршрута недоступны';
+      meta.appendChild(span);
+    }
+
+    btn.appendChild(meta);
+    frag.appendChild(btn);
+  }
+
+  dom.routeList.innerHTML = '';
+  dom.routeList.classList.remove('is-empty');
+  dom.routeList.appendChild(frag);
+  highlightActiveRoute(0);
 }
 
 function loadSavedRoute(id) {
@@ -418,6 +524,10 @@ export function init() {
     load: loader.load || 'package.full',
     mode: loader.mode || 'release'
   });
+  const suggestKey = cfg.suggestApiKey || cfg.suggestKey || null;
+  if (suggestKey) {
+    params.set('suggest_apikey', suggestKey);
+  }
   const apiBase = loader.baseUrl || 'https://api-maps.yandex.ru/2.1/';
   script.src = `${apiBase}?${params.toString()}`;
   if (cfg.nonce) script.nonce = cfg.nonce;
@@ -748,6 +858,28 @@ function getActiveRouteCoordinates(mr) {
   return extractRouteCoordinates(active);
 }
 
+function getActiveRouteIndex(mr) {
+  if (!mr || typeof mr.getRoutes !== 'function') return -1;
+  const routes = mr.getRoutes();
+  if (!routes) return -1;
+  const active = typeof mr.getActiveRoute === 'function' ? mr.getActiveRoute() : null;
+  if (!active) {
+    if (typeof routes.getLength === 'function' && routes.getLength() > 0) return 0;
+    if (Array.isArray(routes) && routes.length > 0) return 0;
+    return -1;
+  }
+
+  if (typeof routes.getLength === 'function') {
+    const len = routes.getLength();
+    for (let i = 0; i < len; i += 1) {
+      if (routes.get(i) === active) return i;
+    }
+  } else if (Array.isArray(routes)) {
+    return routes.indexOf(active);
+  }
+  return -1;
+}
+
 async function updateFramesForRoute(routeCoords) {
   framesLastRouteCoords = Array.isArray(routeCoords)
     ? routeCoords.map(pt => (Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : pt)).filter(pt => Array.isArray(pt) && pt.length >= 2)
@@ -756,6 +888,13 @@ async function updateFramesForRoute(routeCoords) {
   const toggle = document.getElementById('toggle-frames');
   const isEnabled = !!toggle?.checked;
   if (!isEnabled) return;
+
+  const vehicleType = lastMeta?.vehicle || lastOptions?.vehicle || lastOptions?.mode;
+  if (vehicleType === 'car' || vehicleType === 'auto') {
+    const layer = layers.frames;
+    if (layer?.removeAll) layer.removeAll();
+    return;
+  }
 
   try {
     const layer = await loadFrames();
@@ -831,6 +970,7 @@ function setup() {
   const openNavBtn = $('#openNavBtn');
   const savedList = $('#savedRoutesList');
   const vehRadios = $$('input[name=veh]');
+  const routeList = $('#routeList');
 
   dom.from = from;
   dom.to = to;
@@ -840,6 +980,7 @@ function setup() {
   dom.shareBtn = shareBtn;
   dom.openNavBtn = openNavBtn;
   dom.savedList = savedList;
+  dom.routeList = routeList;
 
   // Чекбоксы слоёв (опционально, если добавлены в HTML)
   const cFrames = $('#toggle-frames');
@@ -931,10 +1072,22 @@ function setup() {
     if (target.dataset.action === 'delete') deleteSavedRoute(id);
   });
 
+  routeList?.addEventListener('click', (event) => {
+    const btn = event.target.closest('.tt-route-item');
+    if (!btn) return;
+    const idx = Number(btn.dataset.index);
+    if (Number.isNaN(idx)) return;
+    if (multiRoute?.setActiveRoute) {
+      multiRoute.setActiveRoute(idx);
+    }
+    highlightActiveRoute(idx);
+  });
+
   // Первичная отрисовка UI
   updateUI();
   updateVehGroup();
   renderSavedRoutes();
+  setRouteListEmpty();
   refreshActionButtons();
   restoreFromHash();
   window.addEventListener('hashchange', restoreFromHash);
@@ -949,10 +1102,21 @@ async function onBuild() {
   try {
     const checked = document.querySelector('input[name=veh]:checked');
     const mode = (checked && checked.value) || 'truck40';
+    const cfgRouter = window.TRANSTIME_CONFIG?.router || {};
     const opts = { mode: 'truck' };
-    if (mode === 'car') opts.mode = 'auto';
-    if (mode === 'truck40') opts.weight = 40000;
-    if (mode === 'truckHeavy') opts.weight = 55000;
+    if (mode === 'car') {
+      opts.mode = 'auto';
+    } else if (mode === 'truck40') {
+      opts.weight = cfgRouter.weightLight || 40000;
+      opts.axleCount = cfgRouter.axleLight || 4;
+      opts.dimensions = cfgRouter.dimensionsLight || { height: 4, width: 2.55, length: 16 };
+    } else if (mode === 'truckHeavy') {
+      opts.weight = cfgRouter.weightHeavy || 60000;
+      opts.axleCount = cfgRouter.axleHeavy || 5;
+      opts.dimensions = cfgRouter.dimensionsHeavy || { height: 4.5, width: 2.6, length: 20 };
+    }
+    const altCount = Number(cfgRouter.alternatives);
+    opts.alternatives = Number.isFinite(altCount) && altCount > 0 ? altCount : 3;
 
     const fromVal = $('#from')?.value.trim();
     const toVal   = $('#to')?.value.trim();
@@ -973,6 +1137,15 @@ async function onBuild() {
           console.warn('[TT] remove activeroutechange handler failed', err); // eslint-disable-line no-console
         }
       }
+      multiRouteActiveRouteHandler = null;
+      if (multiRouteRequestSuccessHandler && multiRoute.model?.events?.remove) {
+        try {
+          multiRoute.model.events.remove('requestsuccess', multiRouteRequestSuccessHandler);
+        } catch (err) {
+          console.warn('[TT] remove requestsuccess handler failed', err); // eslint-disable-line no-console
+        }
+      }
+      multiRouteRequestSuccessHandler = null;
       map.geoObjects.remove(multiRoute);
     }
     multiRoute = mr;
@@ -984,13 +1157,40 @@ async function onBuild() {
       if (maybePromise?.catch) {
         maybePromise.catch((err) => console.warn('[TT] frames update failed', err)); // eslint-disable-line no-console
       }
+      const activeIndex = getActiveRouteIndex(multiRoute);
+      highlightActiveRoute(activeIndex);
+      try {
+        const activeRoute = typeof multiRoute?.getActiveRoute === 'function' ? multiRoute.getActiveRoute() : null;
+        const distance = activeRoute?.properties?.get?.('distance');
+        const duration = activeRoute?.properties?.get?.('duration');
+        patchLastMeta({
+          activeRouteIndex: activeIndex,
+          distanceMeters: distance?.value,
+          distanceText: distance?.text,
+          durationSeconds: duration?.value,
+          durationText: duration?.text
+        });
+      } catch (err) {
+        console.warn('[TT] active route meta failed', err); // eslint-disable-line no-console
+      }
     };
     multiRouteActiveRouteHandler = handleActiveRouteChange;
     if (multiRoute?.events?.add) {
       multiRoute.events.add('activeroutechange', handleActiveRouteChange);
     }
 
-    handleActiveRouteChange();
+    const handleRequestSuccess = () => {
+      const routesCollection = typeof multiRoute?.getRoutes === 'function' ? multiRoute.getRoutes() : null;
+      if (routesCollection) {
+        updateRouteList(routesCollection);
+        highlightActiveRoute(getActiveRouteIndex(multiRoute));
+      }
+      handleActiveRouteChange();
+    };
+    multiRouteRequestSuccessHandler = handleRequestSuccess;
+    if (multiRoute?.model?.events?.add) {
+      multiRoute.model.events.add('requestsuccess', handleRequestSuccess);
+    }
 
     const meta = {
       from: fromVal,
@@ -1001,6 +1201,14 @@ async function onBuild() {
     };
     const routeOptions = { ...opts, vehicle: mode };
     setLastRoute(points, routeOptions, meta);
+
+    if (res.routes) {
+      updateRouteList(res.routes);
+    } else {
+      setRouteListEmpty('Маршруты не найдены.');
+    }
+
+    handleActiveRouteChange();
     updateUI();
 
     toast('Маршрут успешно построен', 1800);
@@ -1009,11 +1217,3 @@ async function onBuild() {
   }
 }
 
-/** Авто-инициализация */
-if (typeof window !== 'undefined') {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => { try { init(); } catch (e) { console.error(e); } });
-  } else {
-    try { init(); } catch (e) { console.error(e); }
-  }
-}

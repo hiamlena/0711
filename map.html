@@ -8,7 +8,14 @@
 </head>
 <body>
   <header class="tt-header">
-    <h1>Trans-Time: Карта маршрутов (Яндекс)</h1>
+    <div class="tt-header-top">
+      <h1>Trans-Time: Карта маршрутов (Яндекс)</h1>
+      <p class="tt-header-note">Поддержка мультимаршрутов, via-точек и весовых рамок.</p>
+    </div>
+    <div class="tt-header-hint">
+      <span>Клик по карте — добавить via-точку.</span>
+      <span>Выберите альтернативу в списке маршрутов.</span>
+    </div>
   </header>
 
   <main class="tt-layout">
@@ -89,11 +96,21 @@
     </section>
 
     <section class="tt-map-wrap">
-      <div id="map" class="tt-map"></div>
+      <div class="tt-legend" role="note" aria-label="Обозначения карты">
+        <span class="tt-legend-item tt-legend-active">Активный маршрут</span>
+        <span class="tt-legend-item tt-legend-alt">Альтернативы</span>
+        <span class="tt-legend-item tt-legend-frames">Весовые рамки</span>
+      </div>
+      <div id="map" class="tt-map" aria-label="Интерактивная карта маршрутов"></div>
+      <section class="tt-route-panel" aria-label="Список найденных маршрутов">
+        <h2 class="tt-route-title">Маршруты</h2>
+        <div id="routeList" class="tt-route-list" aria-live="polite"></div>
+      </section>
     </section>
   </main>
 
-  <script src="./config.js?v=2025-11-07"></script>
-  <script type="module" src="./assets/js/yandex.js?v=2025-11-07"></script>
+  <script type="module" src="./errors.js?v=2025-11-07"></script>
+  <script src="./config.js?v=2025-11-07" defer></script>
+  <script type="module" src="./assets/js/app.js?v=2025-11-07"></script>
 </body>
 </html>
