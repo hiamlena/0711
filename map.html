@@ -64,6 +64,15 @@
       </div>
 
       <div class="tt-field-group">
+        <label class="tt-label" for="viaInput">Промежуточные точки</label>
+        <div class="tt-via-controls">
+          <input id="viaInput" class="tt-input" placeholder="Введите адрес via-точки" />
+          <button id="addViaBtn" class="tt-btn" type="button" disabled>Добавить</button>
+        </div>
+        <div id="viaList" class="tt-via-list" aria-live="polite"></div>
+      </div>
+
+      <div class="tt-field-group">
         <p class="tt-label">Сохранённые маршруты</p>
         <div id="savedRoutesList"></div>
       </div>
@@ -102,6 +111,7 @@
         <span class="tt-legend-item tt-legend-frames">Весовые рамки</span>
       </div>
       <div id="map" class="tt-map" aria-label="Интерактивная карта маршрутов"></div>
+      <div id="routeWarnings" class="tt-route-warnings" aria-live="polite"></div>
       <section class="tt-route-panel" aria-label="Список найденных маршрутов">
         <h2 class="tt-route-title">Маршруты</h2>
         <div id="routeList" class="tt-route-list" aria-live="polite"></div>
