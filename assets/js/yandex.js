@@ -5,7 +5,8 @@ import { $, $$, toast, fmtDist, fmtTime, escapeHtml } from './core.js';
 import { YandexRouter } from './router.js';
 
 const STORAGE_KEY = 'tt-yandex-saved-routes';
-let map, multiRoute, viaPoints = [];
+let map, multiRoute;
+let viaPoints = [];
 let multiRouteActiveRouteHandler = null;
 let multiRouteRequestSuccessHandler = null;
 let viaMarkers = [];
@@ -20,8 +21,12 @@ const dom = {
   saveBtn: null,
   shareBtn: null,
   openNavBtn: null,
+  viaInput: null,
+  addViaBtn: null,
+  viaList: null,
   savedList: null,
-  routeList: null
+  routeList: null,
+  routeWarnings: null
 };
 let updateUI = () => {};
 
@@ -36,6 +41,22 @@ const layers = {
 const FRAME_BUFFER_M = 100;
 let framesRawData = null;
 let framesLastRouteCoords = null;
+let frameBypassCollection = null;
+let frameBypassSummary = [];
+
+let restrictionMarkers = [];
+let truckAlternativeCollection = null;
+let restrictionSummary = [];
+
+let hgvAllowedRawData = null;
+let hgvConditionalRawData = null;
+
+const routeWarningsState = {
+  frames: [],
+  restrictions: []
+};
+
+let isAddingVia = false;
 
 let yaErrorShown = false;
 
@@ -126,21 +147,482 @@ function patchLastMeta(data = {}) {
   lastMeta = { ...(lastMeta || {}), ...data };
 }
 
+function normalizeViaPoint(entry, idx = 0) {
+  if (!entry) return null;
+  if (Array.isArray(entry)) {
+    return {
+      coords: [Number(entry[0]), Number(entry[1])],
+      label: null,
+      id: `via-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 5)}`
+    };
+  }
+  if (Array.isArray(entry.coords)) {
+    return {
+      coords: [Number(entry.coords[0]), Number(entry.coords[1])],
+      label: entry.label ? String(entry.label) : null,
+      id: entry.id || `via-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 5)}`
+    };
+  }
+  return null;
+}
+
+function getViaCoordinates(list = viaPoints) {
+  return Array.isArray(list) ? list.map(item => item.coords) : [];
+}
+
+function describeViaPoint(point, idx) {
+  if (!point) return '';
+  if (point.label) return point.label;
+  const [lat, lon] = point.coords || [];
+  if (typeof lat === 'number' && typeof lon === 'number') {
+    return `via ${idx + 1}: ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  }
+  return `via ${idx + 1}`;
+}
+
+function renderViaList() {
+  if (!dom.viaList) return;
+  dom.viaList.innerHTML = '';
+  if (!viaPoints.length) {
+    const note = document.createElement('p');
+    note.className = 'tt-note';
+    note.textContent = 'Via-точки не добавлены. Используйте карту или поле выше.';
+    dom.viaList.appendChild(note);
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  viaPoints.forEach((point, idx) => {
+    const item = document.createElement('div');
+    item.className = 'tt-via-item';
+    item.dataset.index = String(idx);
+
+    const label = document.createElement('span');
+    label.className = 'tt-via-item__label';
+    label.textContent = describeViaPoint(point, idx);
+    item.appendChild(label);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tt-btn tt-btn-icon';
+    btn.dataset.action = 'remove';
+    btn.dataset.index = String(idx);
+    btn.setAttribute('aria-label', `Удалить via-точку ${idx + 1}`);
+    btn.textContent = '×';
+    item.appendChild(btn);
+
+    frag.appendChild(item);
+  });
+
+  dom.viaList.appendChild(frag);
+}
+
+function updateRouteWarnings() {
+  if (!dom.routeWarnings) return;
+  const warnings = [...routeWarningsState.frames, ...routeWarningsState.restrictions];
+  if (!warnings.length) {
+    dom.routeWarnings.classList.remove('is-visible');
+    dom.routeWarnings.innerHTML = '';
+    return;
+  }
+  const list = document.createElement('ul');
+  warnings.forEach((text) => {
+    const li = document.createElement('li');
+    li.textContent = text;
+    list.appendChild(li);
+  });
+  dom.routeWarnings.classList.add('is-visible');
+  dom.routeWarnings.innerHTML = '';
+  dom.routeWarnings.appendChild(list);
+}
+
+function clearFrameBypasses() {
+  frameBypassSummary = [];
+  routeWarningsState.frames = [];
+  if (frameBypassCollection && map?.geoObjects?.contains?.(frameBypassCollection)) {
+    map.geoObjects.remove(frameBypassCollection);
+  }
+  frameBypassCollection?.removeAll?.();
+  updateRouteWarnings();
+}
+
+function clearRestrictionArtifacts() {
+  restrictionSummary = [];
+  routeWarningsState.restrictions = [];
+  restrictionMarkers.forEach(marker => {
+    try { map.geoObjects.remove(marker); } catch (err) { /* noop */ }
+  });
+  restrictionMarkers = [];
+  if (truckAlternativeCollection && map?.geoObjects?.contains?.(truckAlternativeCollection)) {
+    map.geoObjects.remove(truckAlternativeCollection);
+  }
+  truckAlternativeCollection?.removeAll?.();
+  updateRouteWarnings();
+}
+
+function ensureFrameBypassCollection() {
+  if (!map) return null;
+  if (!frameBypassCollection) {
+    frameBypassCollection = new ymaps.GeoObjectCollection({}, {
+      strokeColor: '#f97316',
+      strokeWidth: 4,
+      strokeOpacity: 0.85,
+      strokeStyle: 'dash'
+    });
+  }
+  if (!map.geoObjects.contains(frameBypassCollection)) {
+    map.geoObjects.add(frameBypassCollection);
+  }
+  return frameBypassCollection;
+}
+
+function ensureTruckAlternativeCollection() {
+  if (!map) return null;
+  if (!truckAlternativeCollection) {
+    truckAlternativeCollection = new ymaps.GeoObjectCollection({}, {
+      strokeColor: '#8b5cf6',
+      strokeWidth: 4,
+      strokeOpacity: 0.8,
+      strokeStyle: 'dot'
+    });
+  }
+  if (!map.geoObjects.contains(truckAlternativeCollection)) {
+    map.geoObjects.add(truckAlternativeCollection);
+  }
+  return truckAlternativeCollection;
+}
+
+function extractFeatureCoordinate(feature) {
+  const geom = feature?.geometry;
+  if (!geom) return null;
+  if (geom.type === 'Point') {
+    const coords = geom.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) return null;
+    return [Number(coords[1]), Number(coords[0])];
+  }
+  if (geom.type === 'LineString' && Array.isArray(geom.coordinates) && geom.coordinates.length) {
+    const mid = geom.coordinates[Math.floor(geom.coordinates.length / 2)];
+    if (!Array.isArray(mid) || mid.length < 2) return null;
+    return [Number(mid[1]), Number(mid[0])];
+  }
+  if (geom.type === 'Polygon' && Array.isArray(geom.coordinates) && geom.coordinates[0]?.length) {
+    const ring = geom.coordinates[0];
+    const mid = ring[Math.floor(ring.length / 2)];
+    if (!Array.isArray(mid) || mid.length < 2) return null;
+    return [Number(mid[1]), Number(mid[0])];
+  }
+  return null;
+}
+
+function findNearestRouteIndex(routeCoords, point) {
+  if (!Array.isArray(routeCoords) || routeCoords.length === 0 || !Array.isArray(point)) return -1;
+  let nearest = -1;
+  let min = Infinity;
+  for (let i = 0; i < routeCoords.length; i += 1) {
+    const dist = distanceMeters(routeCoords[i], point);
+    if (dist < min) {
+      min = dist;
+      nearest = i;
+      if (min <= FRAME_BUFFER_M / 2) break;
+    }
+  }
+  return nearest;
+}
+
+function buildBypassMidpoint(before, after, center) {
+  if (!Array.isArray(center)) return null;
+  const start = Array.isArray(before) ? before : center;
+  const end = Array.isArray(after) ? after : center;
+  const dLat = end[0] - start[0];
+  const dLon = end[1] - start[1];
+  const length = Math.hypot(dLat, dLon) || 0.0001;
+  const scale = Math.min(0.01, Math.max(0.002, length * 1.5));
+  const offsetLat = (dLon / length) * scale;
+  const offsetLon = (-dLat / length) * scale;
+  return [center[0] + offsetLat, center[1] + offsetLon];
+}
+
+async function buildFrameBypassesForRoute(routeCoords, options = {}) {
+  if (!Array.isArray(routeCoords) || routeCoords.length < 2) {
+    clearFrameBypasses();
+    return;
+  }
+  try {
+    await loadFrames();
+  } catch (err) {
+    console.warn('[TT] buildFrameBypassesForRoute: frames load failed', err); // eslint-disable-line no-console
+    clearFrameBypasses();
+    return;
+  }
+
+  const filtered = filterFramesForRoute(routeCoords);
+  if (!filtered.features.length) {
+    clearFrameBypasses();
+    return;
+  }
+
+  const basePoints = Array.isArray(lastPoints) ? lastPoints.map(pt => (Array.isArray(pt) ? [pt[0], pt[1]] : pt)) : [];
+  if (basePoints.length < 2) {
+    clearFrameBypasses();
+    return;
+  }
+
+  const collection = ensureFrameBypassCollection();
+  if (!collection) return;
+  collection.removeAll();
+  frameBypassSummary = [];
+
+  const opts = { ...(options || {}), ...(lastOptions || {}), alternatives: 1 };
+
+  for (let i = 0; i < filtered.features.length; i += 1) {
+    if (i > 4) break; // ограничим число обходов, чтобы не перегружать API
+    const feature = filtered.features[i];
+    const center = extractFeatureCoordinate(feature);
+    if (!center) continue;
+    const nearestIdx = findNearestRouteIndex(routeCoords, center);
+    if (nearestIdx < 0) continue;
+    const before = routeCoords[Math.max(0, nearestIdx - 5)];
+    const after = routeCoords[Math.min(routeCoords.length - 1, nearestIdx + 5)];
+    const mid = buildBypassMidpoint(before, after, center);
+    const ref = [...basePoints];
+    if (!mid) continue;
+    ref.splice(ref.length - 1, 0, before, mid, after);
+
+    try {
+      const res = await YandexRouter.build(ref, { ...opts, boundsAutoApply: false });
+      const altRoute = res.routes?.get ? res.routes.get(0) : res.routes?.[0];
+      const coords = altRoute ? extractRouteCoordinates(altRoute) : getActiveRouteCoordinates(res.multiRoute);
+      if (Array.isArray(coords) && coords.length > 1) {
+        const polyline = new ymaps.Polyline(coords, {
+          hintContent: 'Обход рамки'
+        }, {
+          strokeColor: '#f97316',
+          strokeWidth: 4,
+          strokeOpacity: 0.85,
+          strokeStyle: 'dash'
+        });
+        collection.add(polyline);
+        const distance = altRoute?.properties?.get?.('distance');
+        const duration = altRoute?.properties?.get?.('duration');
+        const messageParts = ['Построен обход рамки'];
+        if (distance?.value) messageParts.push(fmtDist(distance.value));
+        if (duration?.value) messageParts.push(fmtTime(duration.value));
+        frameBypassSummary.push(messageParts.join(' — '));
+      }
+      if (res.multiRoute) {
+        try { res.multiRoute.destroy?.(); } catch (err) { /* noop */ }
+      }
+    } catch (err) {
+      console.warn('[TT] bypass build failed', err); // eslint-disable-line no-console
+    }
+  }
+
+  routeWarningsState.frames = frameBypassSummary.slice();
+  updateRouteWarnings();
+}
+
+function pointInPolygon(point, polygon) {
+  if (!Array.isArray(point) || !Array.isArray(polygon) || polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const xi = polygon[i][0];
+    const yi = polygon[i][1];
+    const xj = polygon[j][0];
+    const yj = polygon[j][1];
+    const intersect = ((yi > point[0]) !== (yj > point[0]))
+      && (point[1] < ((xj - xi) * (point[0] - yi)) / (yj - yi + 1e-9) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pointNearFeature(point, feature, tolerance = 120) {
+  if (!feature?.geometry) return false;
+  const geom = feature.geometry;
+  if (geom.type === 'Point') {
+    const coords = Array.isArray(geom.coordinates) ? geom.coordinates : [];
+    if (coords.length < 2) return false;
+    const latLon = [Number(coords[1]), Number(coords[0])];
+    return distanceMeters(point, latLon) <= tolerance;
+  }
+  if (geom.type === 'LineString') {
+    const coords = Array.isArray(geom.coordinates) ? geom.coordinates : [];
+    if (!coords.length) return false;
+    const latLon = coords.map(pair => [Number(pair[1]), Number(pair[0])]);
+    return pointToPolylineMinDistanceMeters(point, latLon) <= tolerance;
+  }
+  if (geom.type === 'Polygon' && Array.isArray(geom.coordinates) && geom.coordinates[0]) {
+    const ring = geom.coordinates[0].map(pair => [Number(pair[1]), Number(pair[0])]);
+    if (pointInPolygon(point, ring)) return true;
+    return pointToPolylineMinDistanceMeters(point, ring) <= tolerance;
+  }
+  return false;
+}
+
+function pointAllowedForVehicle(point, mode) {
+  if (!point) return false;
+  const tolerance = mode === 'truckHeavy' ? 150 : 120;
+  const allowed = hgvAllowedRawData?.features || [];
+  const conditional = hgvConditionalRawData?.features || [];
+  const allowedMatch = allowed.some(feature => pointNearFeature(point, feature, tolerance));
+  if (mode === 'truckHeavy') return allowedMatch;
+  const conditionalMatch = conditional.some(feature => pointNearFeature(point, feature, tolerance));
+  return allowedMatch || conditionalMatch;
+}
+
+function findNearestAllowedPoint(point) {
+  if (!point || !hgvAllowedRawData?.features?.length) return null;
+  let best = null;
+  let min = Infinity;
+  hgvAllowedRawData.features.forEach((feature) => {
+    const geom = feature.geometry;
+    if (!geom) return;
+    if (geom.type === 'Point') {
+      const coords = Array.isArray(geom.coordinates) ? geom.coordinates : [];
+      if (coords.length < 2) return;
+      const latLon = [Number(coords[1]), Number(coords[0])];
+      const dist = distanceMeters(point, latLon);
+      if (dist < min) { min = dist; best = latLon; }
+    } else if (geom.type === 'LineString' && Array.isArray(geom.coordinates)) {
+      geom.coordinates.forEach((pair) => {
+        if (!Array.isArray(pair) || pair.length < 2) return;
+        const latLon = [Number(pair[1]), Number(pair[0])];
+        const dist = distanceMeters(point, latLon);
+        if (dist < min) { min = dist; best = latLon; }
+      });
+    } else if (geom.type === 'Polygon' && Array.isArray(geom.coordinates) && geom.coordinates[0]) {
+      const ring = geom.coordinates[0];
+      ring.forEach((pair) => {
+        if (!Array.isArray(pair) || pair.length < 2) return;
+        const latLon = [Number(pair[1]), Number(pair[0])];
+        const dist = distanceMeters(point, latLon);
+        if (dist < min) { min = dist; best = latLon; }
+      });
+    }
+  });
+  return best;
+}
+
+async function ensureHgvDataLoaded() {
+  try {
+    await Promise.all([loadHgvAllowed(), loadHgvConditional().catch(() => null)]);
+  } catch (err) {
+    console.warn('[TT] ensureHgvDataLoaded failed', err); // eslint-disable-line no-console
+  }
+}
+
+async function checkTruckRestrictions(routeCoords, mode) {
+  if (!Array.isArray(routeCoords) || routeCoords.length < 2) {
+    clearRestrictionArtifacts();
+    return;
+  }
+  if (!mode || mode === 'auto' || mode === 'car') {
+    clearRestrictionArtifacts();
+    return;
+  }
+  await ensureHgvDataLoaded();
+  if (!hgvAllowedRawData && !hgvConditionalRawData) {
+    clearRestrictionArtifacts();
+    return;
+  }
+
+  const step = Math.max(1, Math.floor(routeCoords.length / 200));
+  const violations = [];
+  for (let i = 0; i < routeCoords.length; i += step) {
+    const point = routeCoords[i];
+    if (!pointAllowedForVehicle(point, mode)) {
+      violations.push({ point, index: i });
+    }
+  }
+
+  clearRestrictionArtifacts();
+  if (!violations.length) return;
+
+  const collection = ensureTruckAlternativeCollection();
+  collection?.removeAll?.();
+
+  violations.forEach(({ point }, idx) => {
+    const marker = new ymaps.Placemark(point, {
+      hintContent: 'Ограничение для выбранного ТС',
+      balloonContent: `Участок ${idx + 1}: ограничение движения`
+    }, {
+      preset: 'islands#redCircleDotIcon'
+    });
+    map.geoObjects.add(marker);
+    restrictionMarkers.push(marker);
+  });
+
+  restrictionSummary = [`Маршрут содержит ${violations.length} участок(а) с ограничениями для выбранного транспорта.`];
+
+  const basePoints = Array.isArray(lastPoints) ? lastPoints.map(pt => (Array.isArray(pt) ? [pt[0], pt[1]] : pt)) : [];
+  const targetViolation = violations[0];
+  if (basePoints.length >= 2 && targetViolation) {
+    const fallbackPoint = findNearestAllowedPoint(targetViolation.point);
+    if (fallbackPoint) {
+      const altRef = [...basePoints];
+      altRef.splice(altRef.length - 1, 0, fallbackPoint);
+      try {
+        const res = await YandexRouter.build(altRef, { ...(lastOptions || {}), alternatives: 1, boundsAutoApply: false });
+        const altRoute = res.routes?.get ? res.routes.get(0) : res.routes?.[0];
+        const coords = altRoute ? extractRouteCoordinates(altRoute) : getActiveRouteCoordinates(res.multiRoute);
+        if (Array.isArray(coords) && coords.length > 1) {
+          const polyline = new ymaps.Polyline(coords, {
+            hintContent: 'Альтернативный маршрут для ТС'
+          }, {
+            strokeColor: '#8b5cf6',
+            strokeWidth: 4,
+            strokeOpacity: 0.8,
+            strokeStyle: 'dot'
+          });
+          collection?.add(polyline);
+          restrictionSummary.push('Построен альтернативный маршрут через разрешённый участок.');
+        }
+        if (res.multiRoute) {
+          try { res.multiRoute.destroy?.(); } catch (err) { /* noop */ }
+        }
+      } catch (err) {
+        console.warn('[TT] alternative truck route failed', err); // eslint-disable-line no-console
+      }
+    }
+  }
+
+  routeWarningsState.restrictions = restrictionSummary.slice();
+  updateRouteWarnings();
+}
 function setViaPoints(points = []) {
-  viaPoints = Array.isArray(points) ? points.map(pt => (Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : pt)) : [];
+  const normalized = Array.isArray(points)
+    ? points.map((pt, idx) => normalizeViaPoint(pt, idx)).filter(Boolean)
+    : [];
+  viaPoints = normalized;
   if (map) {
-    viaMarkers.forEach(m => map.geoObjects.remove(m));
+    viaMarkers.forEach((m) => {
+      try { map.geoObjects.remove(m); } catch (err) { /* noop */ }
+    });
     viaMarkers = [];
-    viaPoints.forEach((coords, idx) => {
+    viaPoints.forEach((point, idx) => {
       const mark = new ymaps.Placemark(
-        coords,
-        { hintContent: 'via ' + (idx + 1) },
-        { preset: 'islands#darkGreenCircleDotIcon' }
+        point.coords,
+        { hintContent: describeViaPoint(point, idx) },
+        { preset: 'islands#darkGreenCircleDotIcon', draggable: true }
       );
+      mark.events.add('dragend', (e) => {
+        const target = e.get('target');
+        const coords = target?.geometry?.getCoordinates();
+        if (!Array.isArray(coords)) return;
+        if (viaPoints[idx]) {
+          const label = viaPoints[idx].label && !/^Координаты/.test(viaPoints[idx].label)
+            ? viaPoints[idx].label
+            : `Координаты ${Number(coords[0]).toFixed(5)}, ${Number(coords[1]).toFixed(5)}`;
+          viaPoints[idx] = { ...viaPoints[idx], coords: [Number(coords[0]), Number(coords[1])], label };
+          renderViaList();
+          refreshActionButtons();
+        }
+      });
       map.geoObjects.add(mark);
       viaMarkers.push(mark);
     });
   }
+  renderViaList();
   refreshActionButtons();
   updateUI();
 }
@@ -716,7 +1198,13 @@ async function loadHgvAllowed() {
     preset: 'islands#darkGreenCircleDotIcon',
     zIndex: 210
   });
-  map.geoObjects.add(layers.hgvAllowed);
+  const raw = layers.hgvAllowed.ttSourceData
+    || (typeof layers.hgvAllowed.objects?.getAll === 'function' ? layers.hgvAllowed.objects.getAll() : null);
+  try {
+    hgvAllowedRawData = raw ? JSON.parse(JSON.stringify(raw)) : null;
+  } catch (err) {
+    hgvAllowedRawData = raw;
+  }
   return layers.hgvAllowed;
 }
 async function loadHgvConditional() {
@@ -725,7 +1213,13 @@ async function loadHgvConditional() {
     preset: 'islands#yellowCircleDotIcon',
     zIndex: 205
   });
-  map.geoObjects.add(layers.hgvConditional);
+  const raw = layers.hgvConditional.ttSourceData
+    || (typeof layers.hgvConditional.objects?.getAll === 'function' ? layers.hgvConditional.objects.getAll() : null);
+  try {
+    hgvConditionalRawData = raw ? JSON.parse(JSON.stringify(raw)) : null;
+  } catch (err) {
+    hgvConditionalRawData = raw;
+  }
   return layers.hgvConditional;
 }
 async function loadFederal() {
@@ -734,7 +1228,6 @@ async function loadFederal() {
     preset: 'islands#grayCircleDotIcon',
     zIndex: 200
   });
-  map.geoObjects.add(layers.federal);
   return layers.federal;
 }
 
@@ -971,7 +1464,7 @@ async function updateFramesForRoute(routeCoords) {
     }
 
     if (!framesLastRouteCoords || framesLastRouteCoords.length < 2) {
-      resetAll();
+      hideAll();
       return;
     }
 
@@ -1057,6 +1550,12 @@ function setup() {
 
   // Создаём карту
   map = new ymaps.Map('map', { center, zoom, controls: ['zoomControl', 'typeSelector'] }, { suppressMapOpenBlock: true });
+  try {
+    const trafficControl = new ymaps.control.TrafficControl({ state: { trafficShown: false } });
+    map.controls.add(trafficControl);
+  } catch (err) {
+    console.warn('[TT] traffic control init failed', err); // eslint-disable-line no-console
+  }
 
   // Ссылки на элементы формы/кнопок (если их нет в верстке — код не упадёт)
   const from = $('#from');
@@ -1069,6 +1568,10 @@ function setup() {
   const savedList = $('#savedRoutesList');
   const vehRadios = $$('input[name=veh]');
   const routeList = $('#routeList');
+  const viaInput = $('#viaInput');
+  const addViaBtn = $('#addViaBtn');
+  const viaList = $('#viaList');
+  const routeWarnings = $('#routeWarnings');
 
   dom.from = from;
   dom.to = to;
@@ -1077,8 +1580,26 @@ function setup() {
   dom.saveBtn = saveBtn;
   dom.shareBtn = shareBtn;
   dom.openNavBtn = openNavBtn;
+  dom.viaInput = viaInput;
+  dom.addViaBtn = addViaBtn;
+  dom.viaList = viaList;
   dom.savedList = savedList;
   dom.routeList = routeList;
+  dom.routeWarnings = routeWarnings;
+
+  if (addViaBtn && !addViaBtn.dataset.defaultText) {
+    addViaBtn.dataset.defaultText = addViaBtn.textContent || 'Добавить';
+  }
+
+  if (ymaps?.SuggestView) {
+    try {
+      if (from) new ymaps.SuggestView('from');
+      if (to) new ymaps.SuggestView('to');
+      if (viaInput) new ymaps.SuggestView('viaInput');
+    } catch (err) {
+      console.warn('[TT] suggest init failed', err); // eslint-disable-line no-console
+    }
+  }
 
   // Чекбоксы слоёв (опционально, если добавлены в HTML)
   const cFrames = $('#toggle-frames');
@@ -1114,6 +1635,12 @@ function setup() {
       clearVia.disabled = viaPoints.length === 0;
       clearVia.title = clearVia.disabled ? 'Нет промежуточных точек для сброса' : '';
     }
+    if (dom.addViaBtn) {
+      const defaultText = dom.addViaBtn.dataset.defaultText || 'Добавить';
+      const hasValue = !!dom.viaInput?.value.trim();
+      dom.addViaBtn.disabled = isAddingVia || !hasValue;
+      dom.addViaBtn.textContent = isAddingVia ? 'Добавление…' : defaultText;
+    }
 
     // Демонстрационные рекомендации от Smart Buttons (без внешнего API)
     const recs = [];
@@ -1128,7 +1655,13 @@ function setup() {
   }
 
   // Обработчики ввода
-  [from, to].forEach(inp => inp?.addEventListener('input', updateUI));
+  [from, to, viaInput].forEach(inp => inp?.addEventListener('input', updateUI));
+  viaInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      handleAddViaByAddress();
+    }
+  });
   vehRadios.forEach(radio => radio.addEventListener('change', updateVehGroup));
 
   // Переключатели слоёв (если есть в HTML)
@@ -1143,16 +1676,41 @@ function setup() {
   if (cHgvC?.checked) toggleLayer('hgvConditional', true);
   if (cFed?.checked) toggleLayer('federal', true);
 
+  async function handleAddViaByAddress() {
+    if (!viaInput) return;
+    const value = viaInput.value.trim();
+    if (!value) return;
+    if (isAddingVia) return;
+    isAddingVia = true;
+    updateUI();
+    try {
+      const coords = await YandexRouter.geocode(value);
+      setViaPoints([...viaPoints, { coords, label: value }]);
+      viaInput.value = '';
+      toast('Via-точка добавлена по адресу', 1600);
+    } catch (err) {
+      toast('Не удалось добавить via-точку: ' + (err?.message || err));
+    } finally {
+      isAddingVia = false;
+      updateUI();
+    }
+  }
+
+  addViaBtn?.addEventListener('click', handleAddViaByAddress);
+
   // === Добавление via-точек ===
   map.events.add('click', (e) => {
     const coords = e.get('coords');
-    setViaPoints([...viaPoints, coords]);
+    if (!Array.isArray(coords)) return;
+    const label = `Координаты ${coords[0].toFixed(5)}, ${coords[1].toFixed(5)}`;
+    setViaPoints([...viaPoints, { coords, label }]);
     toast(`Добавлена via-точка (${viaPoints.length})`, 1200);
   });
 
   // === Кнопки управления ===
   buildBtn?.addEventListener('click', onBuild);
   clearVia?.addEventListener('click', () => {
+    if (viaInput) viaInput.value = '';
     setViaPoints([]);
     toast('Via-точки очищены', 1200);
   });
@@ -1170,6 +1728,16 @@ function setup() {
     if (target.dataset.action === 'delete') deleteSavedRoute(id);
   });
 
+  viaList?.addEventListener('click', (event) => {
+    const btn = event.target.closest('button[data-action="remove"]');
+    if (!btn) return;
+    const idx = Number(btn.dataset.index);
+    if (Number.isNaN(idx)) return;
+    const next = viaPoints.filter((_, i) => i !== idx);
+    setViaPoints(next);
+    toast('Via-точка удалена', 1200);
+  });
+
   routeList?.addEventListener('click', (event) => {
     const btn = event.target.closest('.tt-route-item');
     if (!btn) return;
@@ -1183,10 +1751,12 @@ function setup() {
 
   // Первичная отрисовка UI
   updateUI();
+  renderViaList();
   updateVehGroup();
   renderSavedRoutes();
   setRouteListEmpty();
   refreshActionButtons();
+  updateRouteWarnings();
   restoreFromHash();
   window.addEventListener('hashchange', restoreFromHash);
 
@@ -1220,9 +1790,13 @@ async function onBuild() {
     const toVal   = $('#to')?.value.trim();
     if (!fromVal || !toVal) throw new Error('Укажите адреса Откуда и Куда');
 
+    clearFrameBypasses();
+    clearRestrictionArtifacts();
+
     const A = await YandexRouter.geocode(fromVal);
     const B = await YandexRouter.geocode(toVal);
-    const points = [A, ...viaPoints, B];
+    const viaCoords = getViaCoordinates();
+    const points = [A, ...viaCoords, B];
 
     const res = await YandexRouter.build(points, opts);
     const mr = res.multiRoute;
@@ -1248,6 +1822,13 @@ async function onBuild() {
     }
     multiRoute = mr;
     map.geoObjects.add(multiRoute);
+    if (multiRoute?.editor?.start) {
+      try {
+        multiRoute.editor.start({ addWayPoints: true });
+      } catch (err) {
+        console.warn('[TT] route editor start failed', err); // eslint-disable-line no-console
+      }
+    }
 
     const handleActiveRouteChange = () => {
       const coords = getActiveRouteCoordinates(multiRoute);
@@ -1255,6 +1836,22 @@ async function onBuild() {
       if (maybePromise?.catch) {
         maybePromise.catch((err) => console.warn('[TT] frames update failed', err)); // eslint-disable-line no-console
       }
+
+      const vehicleMode = (lastMeta?.vehicle || mode || '').toLowerCase();
+      if (Array.isArray(coords) && coords.length > 1) {
+        if (vehicleMode === 'car' || vehicleMode === 'auto') {
+          clearFrameBypasses();
+        } else {
+          const bypassPromise = buildFrameBypassesForRoute(coords, { vehicleMode });
+          bypassPromise?.catch?.((err) => console.warn('[TT] bypass update failed', err)); // eslint-disable-line no-console
+        }
+        const restrictionPromise = checkTruckRestrictions(coords, vehicleMode);
+        restrictionPromise?.catch?.((err) => console.warn('[TT] restriction check failed', err)); // eslint-disable-line no-console
+      } else {
+        clearFrameBypasses();
+        clearRestrictionArtifacts();
+      }
+
       const activeIndex = getActiveRouteIndex(multiRoute);
       highlightActiveRoute(activeIndex);
       try {
