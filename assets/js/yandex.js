@@ -1019,10 +1019,21 @@ async function toggleLayer(name, on) {
   if (on) {
     const layer = await loader();
     if (!layer) return;
-    if (!map.geoObjects.contains(layer)) map.geoObjects.add(layer);
     if (name === 'frames') {
+      const noRoute = !Array.isArray(framesLastRouteCoords) || framesLastRouteCoords.length < 2;
+      const objects = layer.objects;
+      if (noRoute) {
+        if (typeof objects?.setFilter === 'function') {
+          objects.setFilter(() => false);
+        } else if (typeof layer.removeAll === 'function') {
+          layer.removeAll();
+        }
+      }
+      if (!map.geoObjects.contains(layer)) map.geoObjects.add(layer);
       await updateFramesForRoute(framesLastRouteCoords);
+      return;
     }
+    if (!map.geoObjects.contains(layer)) map.geoObjects.add(layer);
   } else {
     const layer = layers[name];
     if (layer && map.geoObjects.contains(layer)) map.geoObjects.remove(layer);
